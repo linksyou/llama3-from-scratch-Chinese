@@ -1,0 +1,471 @@
+llama3 从头开始实现
+
+在这个文件中，我从头开始实现了 LLAMA3，一次一个张量和矩阵乘法。
+此外，我要直接从 meta 为 LLAMA3 提供的模型文件中加载张量，您需要在运行此文件之前下载权重。 这是下载权重的官方链接：https://llama.meta.com/llama-downloads/
+
+分词器
+
+我不打算实现 BPE 分词器（但 Andrej Karpathy 有一个非常干净的实现）
+链接到他的实现：https://github.com/karpathy/minbpe
+
+from pathlib import Pathimport tiktokenfrom tiktoken.load import load_tiktoken_bpeimport torchimport jsonimport matplotlib.pyplot as plt
+tokenizer_path = "Meta-Llama-3-8B/tokenizer.model"special_tokens = [
+            "<|begin_of_text|>",
+            "<|end_of_text|>",
+            "<|reserved_special_token_0|>",
+            "<|reserved_special_token_1|>",
+            "<|reserved_special_token_2|>",
+            "<|reserved_special_token_3|>",
+            "<|start_header_id|>",
+            "<|end_header_id|>",
+            "<|reserved_special_token_4|>",
+            "<|eot_id|>",  # end of turn
+        ] + [f"<|reserved_special_token_{i}|>" for i in range(5, 256 - 5)]mergeable_ranks = load_tiktoken_bpe(tokenizer_path)tokenizer = tiktoken.Encoding(
+    name=Path(tokenizer_path).name,
+    pat_str=r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+    mergeable_ranks=mergeable_ranks,
+    special_tokens={token: len(mergeable_ranks) + i for i, token in enumerate(special_tokens)},
+)
+tokenizer.decode(tokenizer.encode("hello world!"))
+
+'hello world!'
+
+读取模型文件
+
+通常，阅读此内容取决于模型类的编写方式以及其中的变量名称。
+但是由于我们从头开始实现 LLAMA3，因此我们将一次读取一个 Tensor 文件。
+
+model = torch.load("Meta-Llama-3-8B/consolidated.00.pth")print(json.dumps(list(model.keys())[:20], indent=4))
+[
+    "tok_embeddings.weight",
+    "layers.0.attention.wq.weight",
+    "layers.0.attention.wk.weight",
+    "layers.0.attention.wv.weight",
+    "layers.0.attention.wo.weight",
+    "layers.0.feed_forward.w1.weight",
+    "layers.0.feed_forward.w3.weight",
+    "layers.0.feed_forward.w2.weight",
+    "layers.0.attention_norm.weight",
+    "layers.0.ffn_norm.weight",
+    "layers.1.attention.wq.weight",
+    "layers.1.attention.wk.weight",
+    "layers.1.attention.wv.weight",
+    "layers.1.attention.wo.weight",
+    "layers.1.feed_forward.w1.weight",
+    "layers.1.feed_forward.w3.weight",
+    "layers.1.feed_forward.w2.weight",
+    "layers.1.attention_norm.weight",
+    "layers.1.ffn_norm.weight",
+    "layers.2.attention.wq.weight"
+]
+
+with open("Meta-Llama-3-8B/params.json", "r") as f:
+    config = json.load(f)config
+{'dim': 4096,
+ 'n_layers': 32,
+ 'n_heads': 32,
+ 'n_kv_heads': 8,
+ 'vocab_size': 128256,
+ 'multiple_of': 1024,
+ 'ffn_dim_multiplier': 1.3,
+ 'norm_eps': 1e-05,
+ 'rope_theta': 500000.0}
+
+我们使用此配置来推断有关模型的细节，例如
+
+该模型有 32 个变压器层
+每个多头注意力块有 32 个头
+词汇大小等
+dim = config["dim"]n_layers = config["n_layers"]n_heads = config["n_heads"]n_kv_heads = config["n_kv_heads"]vocab_size = config["vocab_size"]multiple_of = config["multiple_of"]ffn_dim_multiplier = config["ffn_dim_multiplier"]norm_eps = config["norm_eps"]rope_theta = torch.tensor(config["rope_theta"])
+将文本转换为标记
+
+在这里，我们使用 TikToken（我认为是一个 OpenAI 库）作为分词器
+
+prompt = "the answer to the ultimate question of life, the universe, and everything is "tokens = [128000] + tokenizer.encode(prompt)print(tokens)tokens = torch.tensor(tokens)prompt_split_as_tokens = [tokenizer.decode([token.item()]) for token in tokens]print(prompt_split_as_tokens)
+[128000, 1820, 4320, 311, 279, 17139, 3488, 315, 2324, 11, 279, 15861, 11, 323, 4395, 374, 220]
+['<|begin_of_text|>', 'the', ' answer', ' to', ' the', ' ultimate', ' question', ' of', ' life', ',', ' the', ' universe', ',', ' and', ' everything', ' is', ' ']
+将 Token 转换为其嵌入
+
+对不起，这是代码库中唯一使用内置神经网络模块
+的部分，所以我们的 [17x1] 令牌现在是 [17x4096]，即 17 个长度为 4096
+的嵌入（每个令牌一个）
+注意：跟踪形状，它使理解所有内容变得更加容易
+
+embedding_layer = torch.nn.Embedding(vocab_size, dim)embedding_layer.weight.data.copy_(model["tok_embeddings.weight"])token_embeddings_unnormalized = embedding_layer(tokens).to(torch.bfloat16)token_embeddings_unnormalized.shape
+torch.Size([17, 4096])
+然后，我们使用 RMS 归一化对嵌入进行归一化
+
+请注意，在此步骤之后，形状不会改变，值只是要记住的标准化
+事情，我们需要一个norm_eps（来自 config），因为我们不想意外地将 rms 设置为 0 并除以 0，
+公式如下：
+
+# def rms_norm(tensor, norm_weights):#     rms = (tensor.pow(2).mean(-1, keepdim=True) + norm_eps)**0.5#     return tensor * (norm_weights / rms)def rms_norm(tensor, norm_weights):
+    return (tensor * torch.rsqrt(tensor.pow(2).mean(-1, keepdim=True) + norm_eps)) * norm_weights
+构建 transformer 的第一层
+
+正常化
+
+无论如何，你会看到我从模型 dict 中访问 layer.0（这是第一层），
+所以在规范化后，我们的形状仍然 [17x4096] 与嵌入相同，但已规范化
+
+token_embeddings = rms_norm(token_embeddings_unnormalized, model["layers.0.attention_norm.weight"])token_embeddings.shape
+torch.Size([17, 4096])
+从零开始实施的 Attention
+
+让我们加载 transformer 第一层的 attention heads
+
+>当我们从模型中加载查询、键、值和输出向量时，我们注意到形状是 [4096x4096]、[1024x4096]、[1024x4096]、[4096x4096]
+>乍一看这很奇怪，因为理想情况下，我们希望每个头的每个 q、k、v 和 o 单独>
+代码的作者将它们捆绑在一起，因为它很容易，它有助于比较注意力头乘法。
+>我要解开所有东西......
+
+print(
+    model["layers.0.attention.wq.weight"].shape,
+    model["layers.0.attention.wk.weight"].shape,
+    model["layers.0.attention.wv.weight"].shape,
+    model["layers.0.attention.wo.weight"].shape
+)
+
+torch.Size([4096, 4096]) torch.Size([1024, 4096]) torch.Size([1024, 4096]) torch.Size([4096, 4096])
+
+解包查询
+
+在下一节中，我们将解包来自多个 Attention Heads 的查询，结果形状为 [32x128x4096]
+
+，32 是 llama3 中的注意力头数量，128 是查询向量的大小，4096 是标记嵌入的大小
+q_layer0 = model["layers.0.attention.wq.weight"]head_dim = q_layer0.shape[0] // n_headsq_layer0 = q_layer0.view(n_heads, head_dim, dim)q_layer0.shape
+torch.Size([32, 128, 4096])
+我将实现第一层的第一个 head
+
+这里我访问的是第一层的查询权重矩阵第一个头，这个查询权重矩阵的大小是 [128x4096]
+q_layer0_head0 = q_layer0[0]q_layer0_head0.shape
+torch.Size([128, 4096])
+现在，我们将查询权重与 token 嵌入相乘，以接收对 token 的查询
+
+在这里，你可以看到结果的形状是 [17x128]，这是因为我们有 17 个标记，每个标记都有一个 128 长度的查询。
+
+q_per_token = torch.matmul(token_embeddings, q_layer0_head0.T)q_per_token.shape
+torch.Size([17, 128])
+定位编码
+
+我们现在处于一个阶段，我们对于提示中的每个 token 都有一个查询向量，但如果你仔细想想 —— 单个查询向量不知道在提示中的位置。
+
+query： “生命、宇宙和万物的终极问题的答案是 ”
+
+在我们的提示符中，我们使用了 “the” 三次，我们需要所有 3 个 “the” 标记的查询向量根据它们在查询中的位置具有不同的查询向量（每个大小为 [1x128]）。我们使用 RoPE （rotory positional embedding） 执行这些旋转。
+绳
+
+观看此视频（这是我观看的）以理解数学。https://www.youtube.com/watch?v=o29P0Kpobz0&t=530s
+
+q_per_token_split_into_pairs = q_per_token.float().view(q_per_token.shape[0], -1, 2)q_per_token_split_into_pairs.shape
+torch.Size([17, 64, 2])
+在上面的步骤中，我们将查询向量分成几对，我们对每对应用旋转角度偏移！
+
+我们现在有一个大小为 [17x64x2] 的向量，这是 128 个长度的查询，对于提示中的每个标记，分为 64 对！这 64 对中的每一对都将由 m*（theta） 旋转，其中 m 是我们旋转查询的代币的位置！
+
+使用复数的点积旋转向量
+
+
+zero_to_one_split_into_64_parts = torch.tensor(range(64))/64zero_to_one_split_into_64_parts
+tensor([0.0000, 0.0156, 0.0312, 0.0469, 0.0625, 0.0781, 0.0938, 0.1094, 0.1250,
+        0.1406, 0.1562, 0.1719, 0.1875, 0.2031, 0.2188, 0.2344, 0.2500, 0.2656,
+        0.2812, 0.2969, 0.3125, 0.3281, 0.3438, 0.3594, 0.3750, 0.3906, 0.4062,
+        0.4219, 0.4375, 0.4531, 0.4688, 0.4844, 0.5000, 0.5156, 0.5312, 0.5469,
+        0.5625, 0.5781, 0.5938, 0.6094, 0.6250, 0.6406, 0.6562, 0.6719, 0.6875,
+        0.7031, 0.7188, 0.7344, 0.7500, 0.7656, 0.7812, 0.7969, 0.8125, 0.8281,
+        0.8438, 0.8594, 0.8750, 0.8906, 0.9062, 0.9219, 0.9375, 0.9531, 0.9688,
+        0.9844])
+freqs = 1.0 / (rope_theta ** zero_to_one_split_into_64_parts)freqs
+tensor([1.0000e+00, 8.1462e-01, 6.6360e-01, 5.4058e-01, 4.4037e-01, 3.5873e-01,
+        2.9223e-01, 2.3805e-01, 1.9392e-01, 1.5797e-01, 1.2869e-01, 1.0483e-01,
+        8.5397e-02, 6.9566e-02, 5.6670e-02, 4.6164e-02, 3.7606e-02, 3.0635e-02,
+        2.4955e-02, 2.0329e-02, 1.6560e-02, 1.3490e-02, 1.0990e-02, 8.9523e-03,
+        7.2927e-03, 5.9407e-03, 4.8394e-03, 3.9423e-03, 3.2114e-03, 2.6161e-03,
+        2.1311e-03, 1.7360e-03, 1.4142e-03, 1.1520e-03, 9.3847e-04, 7.6450e-04,
+        6.2277e-04, 5.0732e-04, 4.1327e-04, 3.3666e-04, 2.7425e-04, 2.2341e-04,
+        1.8199e-04, 1.4825e-04, 1.2077e-04, 9.8381e-05, 8.0143e-05, 6.5286e-05,
+        5.3183e-05, 4.3324e-05, 3.5292e-05, 2.8750e-05, 2.3420e-05, 1.9078e-05,
+        1.5542e-05, 1.2660e-05, 1.0313e-05, 8.4015e-06, 6.8440e-06, 5.5752e-06,
+        4.5417e-06, 3.6997e-06, 3.0139e-06, 2.4551e-06])
+freqs_for_each_token = torch.outer(torch.arange(17), freqs)freqs_cis = torch.polar(torch.ones_like(freqs_for_each_token), freqs_for_each_token)freqs_cis.shape
+# viewing tjhe third row of freqs_cisvalue = freqs_cis[3]plt.figure()for i, element in enumerate(value[:17]):
+    plt.plot([0, element.real], [0, element.imag], color='blue', linewidth=1, label=f"Index: {i}")
+    plt.annotate(f"{i}", xy=(element.real, element.imag), color='red')plt.xlabel('Real')plt.ylabel('Imaginary')plt.title('Plot of one row of freqs_cis')plt.show()
+
+现在，我们为每个 token 的 query 元素提供了一个复数（角度变化向量）
+
+我们可以将查询（我们分成对的查询）转换为复数，然后 dot product 根据位置
+honeslty 旋转查询，这很好想想:)
+
+q_per_token_as_complex_numbers = torch.view_as_complex(q_per_token_split_into_pairs)q_per_token_as_complex_numbers.shape
+torch.Size([17, 64])
+q_per_token_as_complex_numbers_rotated = q_per_token_as_complex_numbers * freqs_cisq_per_token_as_complex_numbers_rotated.shape
+torch.Size([17, 64])
+
+获取旋转向量后
+
+我们可以通过再次将复数视为实数来取回成对的查询
+q_per_token_split_into_pairs_rotated = torch.view_as_real(q_per_token_as_complex_numbers_rotated)q_per_token_split_into_pairs_rotated.shape
+torch.Size([17, 64, 2])
+
+旋转对现在已合并，我们现在有一个形状为 [17x128] 的新查询向量（旋转查询向量），其中 17 是标记的数量，128 是查询向量的 dim
+
+q_per_token_rotated = q_per_token_split_into_pairs_rotated.view(q_per_token.shape)q_per_token_rotated.shape
+torch.Size([17, 128])
+
+键（与 queries 几乎相同）
+
+
+我懒惰，所以我不打算对键进行数学运算，你唯一需要记住的是：
+>键生成的键向量也是 128 个
+>键只有查询权重数量的 1/4，这是因为键的权重一次在 4 个头之间共享， 为了减少计算次数，需要
+>键也被轮换以添加位置信息，就像查询一样，因为同样的原因
+
+k_layer0 = model["layers.0.attention.wk.weight"]k_layer0 = k_layer0.view(n_kv_heads, k_layer0.shape[0] // n_kv_heads, dim)k_layer0.shape
+torch.Size([8, 128, 4096])
+k_layer0_head0 = k_layer0[0]k_layer0_head0.shape
+torch.Size([128, 4096])
+k_per_token = torch.matmul(token_embeddings, k_layer0_head0.T)k_per_token.shape
+torch.Size([17, 128])
+k_per_token_split_into_pairs = k_per_token.float().view(k_per_token.shape[0], -1, 2)k_per_token_split_into_pairs.shape
+torch.Size([17, 64, 2])
+k_per_token_as_complex_numbers = torch.view_as_complex(k_per_token_split_into_pairs)k_per_token_as_complex_numbers.shape
+torch.Size([17, 64])
+k_per_token_split_into_pairs_rotated = torch.view_as_real(k_per_token_as_complex_numbers * freqs_cis)k_per_token_split_into_pairs_rotated.shape
+torch.Size([17, 64, 2])
+k_per_token_rotated = k_per_token_split_into_pairs_rotated.view(k_per_token.shape)k_per_token_rotated.shape
+torch.Size([17, 128])
+
+在此阶段，现在每个令牌都有 queries 和 keys 的轮换值。
+
+
+现在，每个查询和键的形状都是 [17x128]。
+在下一步中，我们将乘以查询和键矩阵
+
+这样做会给我们一个分数，将每个 Token 相互映射
+，这个分数描述了每个 Token 的查询与每个 Token 的键的关联程度。 这就是 SELF ATTENTION :)
+注意力分数矩阵 （qk_per_token） 的形状为 [17x17]，其中 17 是提示中的标记数
+
+qk_per_token = torch.matmul(q_per_token_rotated, k_per_token_rotated.T)/(head_dim)**0.5qk_per_token.shape
+torch.Size([17, 17])
+我们现在必须屏蔽 Query Key Scores
+
+在 llama3 的训练过程中，未来代币 QK 分数被屏蔽。
+为什么？因为在训练过程中，我们只学习使用过去的标记来预测标记。
+因此，在推理过程中，我们将 Future Tokens 设置为零。
+
+def display_qk_heatmap(qk_per_token):
+    _, ax = plt.subplots()
+    im = ax.imshow(qk_per_token.to(float).detach(), cmap='viridis')
+    ax.set_xticks(range(len(prompt_split_as_tokens)))
+    ax.set_yticks(range(len(prompt_split_as_tokens)))
+    ax.set_xticklabels(prompt_split_as_tokens)
+    ax.set_yticklabels(prompt_split_as_tokens)
+    ax.figure.colorbar(im, ax=ax)
+    display_qk_heatmap(qk_per_token)
+
+mask = torch.full((len(tokens), len(tokens)), float("-inf"), device=tokens.device)mask = torch.triu(mask, diagonal=1)mask
+tensor([[0., -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf],
+        [0., 0., -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf],
+        [0., 0., 0., -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf],
+        [0., 0., 0., 0., -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf],
+        [0., 0., 0., 0., 0., -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf],
+        [0., 0., 0., 0., 0., 0., -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf],
+        [0., 0., 0., 0., 0., 0., 0., -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf],
+        [0., 0., 0., 0., 0., 0., 0., 0., -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf],
+        [0., 0., 0., 0., 0., 0., 0., 0., 0., -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf],
+        [0., 0., 0., 0., 0., 0., 0., 0., 0., 0., -inf, -inf, -inf, -inf, -inf, -inf, -inf],
+        [0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., -inf, -inf, -inf, -inf, -inf, -inf],
+        [0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., -inf, -inf, -inf, -inf, -inf],
+        [0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., -inf, -inf, -inf, -inf],
+        [0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., -inf, -inf, -inf],
+        [0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., -inf, -inf],
+        [0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., -inf],
+        [0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.]])
+qk_per_token_after_masking = qk_per_token + maskdisplay_qk_heatmap(qk_per_token_after_masking)
+
+
+qk_per_token_after_masking_after_softmax = torch.nn.functional.softmax(qk_per_token_after_masking, dim=1).to(torch.bfloat16)display_qk_heatmap(qk_per_token_after_masking_after_softmax)
+
+值（几乎是注意力的终点）
+
+
+这些分数 （0-1） 用于确定每个 Token
+使用了多少值矩阵>就像键一样，值权重也是每 4 个注意力头共享的（以节省计算）
+>因此，下面的值权重矩阵的形状是 [8x128x4096]
+v_layer0 = model["layers.0.attention.wv.weight"]v_layer0 = v_layer0.view(n_kv_heads, v_layer0.shape[0] // n_kv_heads, dim)v_layer0.shape
+torch.Size([8, 128, 4096])
+第一层，第一个 head value 权重矩阵如下
+v_layer0_head0 = v_layer0[0]v_layer0_head0.shape
+torch.Size([128, 4096])
+值向量
+
+
+我们现在使用 Value Weghts 来获取每个标记的 attention 值，其大小为 [17x128]，其中 17 是提示中的标记数，128 是每个标记的值向量的 dim
+v_per_token = torch.matmul(token_embeddings, v_layer0_head0.T)v_per_token.shape
+torch.Size([17, 128])
+注意力
+
+
+与每个标记的值相乘后，生成的注意力向量的形状为 [17*128]
+qkv_attention = torch.matmul(qk_per_token_after_masking_after_softmax, v_per_token)qkv_attention.shape
+torch.Size([17, 128])
+多头注意力
+
+
+我们现在有了第一层和第一个头的注意力值现在
+我要运行一个循环并执行与上面的单元格完全相同的数学运算，但对于第一层中的每个头，我们现在有一个第一层上所有 32 个头的 qkv_attention 矩阵，接下来我要把所有注意力分数合并成一个大小为 [17x4096]
+的大矩阵，我们快到了最后:)
+qkv_attention_store = []
+for head in range(n_heads):
+    q_layer0_head = q_layer0[head]
+    k_layer0_head = k_layer0[head//4] # key weights are shared across 4 heads
+    v_layer0_head = v_layer0[head//4] # value weights are shared across 4 heads
+    q_per_token = torch.matmul(token_embeddings, q_layer0_head.T)
+    k_per_token = torch.matmul(token_embeddings, k_layer0_head.T)
+    v_per_token = torch.matmul(token_embeddings, v_layer0_head.T)
+
+    q_per_token_split_into_pairs = q_per_token.float().view(q_per_token.shape[0], -1, 2)
+    q_per_token_as_complex_numbers = torch.view_as_complex(q_per_token_split_into_pairs)
+    q_per_token_split_into_pairs_rotated = torch.view_as_real(q_per_token_as_complex_numbers * freqs_cis[:len(tokens)])
+    q_per_token_rotated = q_per_token_split_into_pairs_rotated.view(q_per_token.shape)
+
+    k_per_token_split_into_pairs = k_per_token.float().view(k_per_token.shape[0], -1, 2)
+    k_per_token_as_complex_numbers = torch.view_as_complex(k_per_token_split_into_pairs)
+    k_per_token_split_into_pairs_rotated = torch.view_as_real(k_per_token_as_complex_numbers * freqs_cis[:len(tokens)])
+    k_per_token_rotated = k_per_token_split_into_pairs_rotated.view(k_per_token.shape)
+
+    qk_per_token = torch.matmul(q_per_token_rotated, k_per_token_rotated.T)/(128)**0.5
+    mask = torch.full((len(tokens), len(tokens)), float("-inf"), device=tokens.device)
+    mask = torch.triu(mask, diagonal=1)
+    qk_per_token_after_masking = qk_per_token + mask
+    qk_per_token_after_masking_after_softmax = torch.nn.functional.softmax(qk_per_token_after_masking, dim=1).to(torch.bfloat16)
+    qkv_attention = torch.matmul(qk_per_token_after_masking_after_softmax, v_per_token)
+    qkv_attention = torch.matmul(qk_per_token_after_masking_after_softmax, v_per_token)
+    qkv_attention_store.append(qkv_attention)
+len(qkv_attention_store)
+32
+
+stacked_qkv_attention = torch.cat(qkv_attention_store, dim=-1)stacked_qkv_attention.shape
+torch.Size([17, 4096])
+Weight Matrix，最后的步骤之一
+
+
+对于第 0 层 Attention 来说，最后要做的一件事是，将
+w_layer0 = model["layers.0.attention.wo.weight"]w_layer0.shape
+torch.Size([4096, 4096])
+这是一个简单的线性层，所以我们只需 matmul
+
+embedding_delta = torch.matmul(stacked_qkv_attention, w_layer0.T)embedding_delta.shape
+torch.Size([17, 4096])
+
+现在，我们在 attention 之后有了 embedding 值的变化，这应该添加到原始的 token embedding 中
+embedding_after_edit = token_embeddings_unnormalized + embedding_deltaembedding_after_edit.shape
+torch.Size([17, 4096])
+我们归一化，然后通过嵌入增量运行前馈神经网络
+
+
+embedding_after_edit_normalized = rms_norm(embedding_after_edit, model["layers.0.ffn_norm.weight"])embedding_after_edit_normalized.shape
+torch.Size([17, 4096])
+加载 FF 权重并实现前馈网络
+
+
+在 llama3 中，他们使用了 SwiGLU 前馈网络，这种网络架构非常擅长在模型需要时添加非线性。
+如今，在 LLMS 中使用这种前馈网络架构是非常标准的
+w1 = model["layers.0.feed_forward.w1.weight"]w2 = model["layers.0.feed_forward.w2.weight"]w3 = model["layers.0.feed_forward.w3.weight"]output_after_feedforward = torch.matmul(torch.functional.F.silu(torch.matmul(embedding_after_edit_normalized, w1.T)) * torch.matmul(embedding_after_edit_normalized, w3.T), w2.T)output_after_feedforward.shape
+torch.Size([17, 4096])
+我们终于为第一层之后的每个 TOKEN 有了新的编辑嵌入
+
+在我们完成之前，只剩下 31 层了（一个 for 循环），
+你可以想象这个编辑后的嵌入包含第一层
+上提出的所有查询的信息，现在每一层都会对提出的问题进行越来越复杂的查询编码，直到我们有一个知道我们需要的下一个标记的所有信息的嵌入。
+layer_0_embedding = embedding_after_edit+output_after_feedforwardlayer_0_embedding.shape
+torch.Size([17, 4096])
+上帝，一切都同时发生
+
+
+是的，就是这个。我们之前所做的一切，一次性完成，用于每一层。
+祝您阅读愉快 :)
+
+final_embedding = token_embeddings_unnormalizedfor layer in range(n_layers):
+    qkv_attention_store = []
+    layer_embedding_norm = rms_norm(final_embedding, model[f"layers.{layer}.attention_norm.weight"])
+    q_layer = model[f"layers.{layer}.attention.wq.weight"]
+    q_layer = q_layer.view(n_heads, q_layer.shape[0] // n_heads, dim)
+    k_layer = model[f"layers.{layer}.attention.wk.weight"]
+    k_layer = k_layer.view(n_kv_heads, k_layer.shape[0] // n_kv_heads, dim)
+    v_layer = model[f"layers.{layer}.attention.wv.weight"]
+    v_layer = v_layer.view(n_kv_heads, v_layer.shape[0] // n_kv_heads, dim)
+    w_layer = model[f"layers.{layer}.attention.wo.weight"]
+    for head in range(n_heads):
+        q_layer_head = q_layer[head]
+        k_layer_head = k_layer[head//4]
+        v_layer_head = v_layer[head//4]
+        q_per_token = torch.matmul(layer_embedding_norm, q_layer_head.T)
+        k_per_token = torch.matmul(layer_embedding_norm, k_layer_head.T)
+        v_per_token = torch.matmul(layer_embedding_norm, v_layer_head.T)
+        q_per_token_split_into_pairs = q_per_token.float().view(q_per_token.shape[0], -1, 2)
+        q_per_token_as_complex_numbers = torch.view_as_complex(q_per_token_split_into_pairs)
+        q_per_token_split_into_pairs_rotated = torch.view_as_real(q_per_token_as_complex_numbers * freqs_cis)
+        q_per_token_rotated = q_per_token_split_into_pairs_rotated.view(q_per_token.shape)
+        k_per_token_split_into_pairs = k_per_token.float().view(k_per_token.shape[0], -1, 2)
+        k_per_token_as_complex_numbers = torch.view_as_complex(k_per_token_split_into_pairs)
+        k_per_token_split_into_pairs_rotated = torch.view_as_real(k_per_token_as_complex_numbers * freqs_cis)
+        k_per_token_rotated = k_per_token_split_into_pairs_rotated.view(k_per_token.shape)
+        qk_per_token = torch.matmul(q_per_token_rotated, k_per_token_rotated.T)/(128)**0.5
+        mask = torch.full((len(token_embeddings_unnormalized), len(token_embeddings_unnormalized)), float("-inf"))
+        mask = torch.triu(mask, diagonal=1)
+        qk_per_token_after_masking = qk_per_token + mask
+        qk_per_token_after_masking_after_softmax = torch.nn.functional.softmax(qk_per_token_after_masking, dim=1).to(torch.bfloat16)
+        qkv_attention = torch.matmul(qk_per_token_after_masking_after_softmax, v_per_token)
+        qkv_attention_store.append(qkv_attention)
+
+    stacked_qkv_attention = torch.cat(qkv_attention_store, dim=-1)
+    w_layer = model[f"layers.{layer}.attention.wo.weight"]
+    embedding_delta = torch.matmul(stacked_qkv_attention, w_layer.T)
+    embedding_after_edit = final_embedding + embedding_delta
+    embedding_after_edit_normalized = rms_norm(embedding_after_edit, model[f"layers.{layer}.ffn_norm.weight"])
+    w1 = model[f"layers.{layer}.feed_forward.w1.weight"]
+    w2 = model[f"layers.{layer}.feed_forward.w2.weight"]
+    w3 = model[f"layers.{layer}.feed_forward.w3.weight"]
+    output_after_feedforward = torch.matmul(torch.functional.F.silu(torch.matmul(embedding_after_edit_normalized, w1.T)) * torch.matmul(embedding_after_edit_normalized, w3.T), w2.T)
+    final_embedding = embedding_after_edit+output_after_feedforward
+我们现在有了最终的嵌入，这是模型对下一个 Token 的最佳猜测
+
+嵌入的形状与常规标记嵌入相同 [17x4096]，其中 17 是标记的数量，4096 是嵌入的 Dim
+
+final_embedding = rms_norm(final_embedding, model["norm.weight"])final_embedding.shape
+torch.Size([17, 4096])
+最后，让我们将嵌入解码为 Token 值
+
+
+我们将使用 output 解码器将最终的 embedding 转换为 token
+model["output.weight"].shape
+torch.Size([128256, 4096])
+我们使用最后一个标记的嵌入来预测下一个值
+
+希望在我们的例子中，42 :) 注意：42 是“生命、宇宙和万物的终极问题的答案是”的答案，根据《银河系漫游指南》一书，大多数现代 LLM 都会在这里用 42 来回答，这应该验证了我们的整个代码！祝我好运:)
+logits = torch.matmul(final_embedding[-1], model["output.weight"].T)logits.shape
+torch.Size([128256])
+模型预测代币编号 2983 作为下一个代币，这是 42 的代币编号吗？
+
+我提醒你，这是最后一部分代码，希望你:)玩得开心
+next_token = torch.argmax(logits, dim=-1)next_token
+tensor(2983)
+我们走吧
+
+
+tokenizer.decode([next_token.item()])
+'42'
+谢谢你，我爱你:)
+
+这就是结束。希望您喜欢阅读它！
+如果您想支持我的工作
+在 Twitter 上关注我 https://twitter.com/naklecha
+或者，给我买杯咖啡 https://www.buymeacoffee.com/naklecha
+老实说，如果你走到了这一步，你已经让我的一天:)
+是什么激励着我？
+
+我和我的朋友们肩负着一个使命 - 让研究更容易获得！ 我们创建了一个名为 A10 的研究实验室 - AAAAAAAAAA.org
+A10 推特 - https://twitter.com/aaaaaaaaaaorg
+我们的论文：
